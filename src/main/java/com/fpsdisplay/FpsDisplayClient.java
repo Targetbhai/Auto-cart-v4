@@ -28,6 +28,7 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Predicate;
 
@@ -42,7 +43,7 @@ import java.util.function.Predicate;
  */
 public class FpsDisplayClient implements ClientModInitializer {
 
-	private enum Step { IDLE, SHOOT }
+	private enum Step { IDLE, SHOOT, REFILL }
 
 	/** Ticks from pressing V until the arrow is fired (20 ticks = 1 second). */
 	private static final int SHOOT_DELAY_TICKS = 4;
@@ -57,6 +58,11 @@ public class FpsDisplayClient implements ClientModInitializer {
 	private int wait = 0;
 	private int timeout = 0;
 	private int relights = 0;
+	private int origSlot = 0;
+	private int cartSlot = -1;   // hotbar slot the TNT minecart came from (-1 = was in inventory)
+	private int railSlot = -1;   // hotbar slot the rail came from
+	private int refillTries = 0;
+	private final List<int[]> swaps = new ArrayList<>();
 	private boolean wasEnabled = true;
 
 	private BlockHitResult target;
@@ -107,8 +113,10 @@ public class FpsDisplayClient implements ClientModInitializer {
 
 		// Pressing V again cancels a running sequence
 		while (keyV.consumeClick()) {
-			abort(player, "Cancelled");
-			return;
+			if (step == Step.SHOOT) {
+				abort(player, "Cancelled");
+				return;
+			}
 		}
 
 		if (wait > 0) { wait--; return; }
@@ -132,6 +140,8 @@ public class FpsDisplayClient implements ClientModInitializer {
 		cart = null;
 		timeout = 0;
 		relights = 0;
+		swaps.clear();
+		origSlot = player.getInventory().getSelectedSlot();
 		try {
 			placeEverything(mc, player);
 		} catch (Exception e) {
@@ -143,6 +153,9 @@ public class FpsDisplayClient implements ClientModInitializer {
 	private void placeEverything(Minecraft mc, LocalPlayer player) {
 		MultiPlayerGameMode gm = mc.gameMode;
 		Level level = mc.level;
+
+		cartSlot = hotbarIndexOf(player, IS_CART);
+		railSlot = hotbarIndexOf(player, IS_RAIL);
 
 		// 1) rail
 		if (!select(mc, player, IS_RAIL)) { abort(player, "No rail"); return; }
@@ -176,6 +189,7 @@ public class FpsDisplayClient implements ClientModInitializer {
 	}
 
 	private void run(Minecraft mc, LocalPlayer player) {
+		if (step == Step.REFILL) { refill(mc, player); return; }
 		Level level = mc.level;
 		timeout++;
 
@@ -203,7 +217,53 @@ public class FpsDisplayClient implements ClientModInitializer {
 		if (!select(mc, player, IS_CROSSBOW)) { abort(player, "No loaded crossbow"); return; }
 		lookAt(player, cart.position().add(0, 0.35, 0));
 		mc.gameMode.useItem(player, InteractionHand.MAIN_HAND);
+		restoreHotbar(mc, player);
+		step = Step.REFILL;
+		wait = 3;
+		refillTries = 0;
+	}
+
+	/** Put a new TNT minecart / rail into the hotbar slot the used one came from (only if it is now empty). */
+	private void refill(Minecraft mc, LocalPlayer player) {
+		var inv = player.getInventory();
+		refillTries++;
+		boolean pending = false;
+
+		if (cartSlot >= 0) {
+			ItemStack st = inv.getItem(cartSlot);
+			if (st.isEmpty()) {
+				moveFromInventory(mc, player, IS_CART, cartSlot);
+				cartSlot = -1;
+			} else if (IS_CART.test(st)) {
+				pending = true;          // client has not registered the used minecart yet
+			} else {
+				cartSlot = -1;
+			}
+		}
+		if (railSlot >= 0) {
+			ItemStack st = inv.getItem(railSlot);
+			if (st.isEmpty()) {
+				moveFromInventory(mc, player, IS_RAIL, railSlot);
+				railSlot = -1;
+			} else {
+				railSlot = -1;           // stack still has rails left - nothing to refill
+			}
+		}
+
+		if (pending && refillTries < 10) { wait = 1; return; }
 		step = Step.IDLE;
+	}
+
+	/** Moves the first matching stack from the main inventory (slots 9-35) into the given empty hotbar slot. */
+	private void moveFromInventory(Minecraft mc, LocalPlayer player, Predicate<ItemStack> p, int hotbarSlot) {
+		var inv = player.getInventory();
+		for (int i = 9; i < 36; i++) {
+			if (p.test(inv.getItem(i))) {
+				mc.gameMode.handleInventoryMouseClick(
+						player.inventoryMenu.containerId, i, hotbarSlot, ClickType.SWAP, player);
+				return;
+			}
+		}
 	}
 
 	// --------------------------------------------------------------- helpers
@@ -238,13 +298,42 @@ public class FpsDisplayClient implements ClientModInitializer {
 		}
 		for (int i = 9; i < 36; i++) {
 			if (p.test(inv.getItem(i))) {
-				int hotbar = inv.getSelectedSlot();
+				int hotbar = chooseSwapSlot(player);
+				if (hotbar < 0) return false;
 				mc.gameMode.handleInventoryMouseClick(
 						player.inventoryMenu.containerId, i, hotbar, ClickType.SWAP, player);
+				swaps.add(new int[] { i, hotbar });
+				inv.setSelectedSlot(hotbar);
 				return p.test(inv.getItem(hotbar));
 			}
 		}
 		return false;
+	}
+
+	/** First hotbar slot of a matching item, or -1. */
+	private int hotbarIndexOf(LocalPlayer player, Predicate<ItemStack> p) {
+		var inv = player.getInventory();
+		for (int i = 0; i < 9; i++) {
+			if (p.test(inv.getItem(i))) return i;
+		}
+		return -1;
+	}
+
+	/** Hotbar slot an inventory item may be swapped into: an empty slot first, never a sword or TNT minecart. */
+	private int chooseSwapSlot(LocalPlayer player) {
+		var inv = player.getInventory();
+		for (int i = 0; i < 9; i++) {
+			if (inv.getItem(i).isEmpty()) return i;
+		}
+		for (int i = 0; i < 9; i++) {
+			if (!isProtected(inv.getItem(i))) return i;
+		}
+		return -1;
+	}
+
+	private boolean isProtected(ItemStack s) {
+		return s.is(ItemTags.SWORDS) || IS_CART.test(s) || IS_RAIL.test(s)
+				|| IS_FLINT.test(s) || IS_CROSSBOW.test(s);
 	}
 
 	private MinecartTNT findCart(Level level) {
@@ -292,8 +381,21 @@ public class FpsDisplayClient implements ClientModInitializer {
 	}
 
 	private void abort(LocalPlayer player, String reason) {
+		restoreHotbar(Minecraft.getInstance(), player);
 		step = Step.IDLE;
 		msg(player, "Crossbow cart stopped: " + reason);
+	}
+
+	/** Undo every inventory swap (in reverse order) and re-select the slot you were holding. */
+	private void restoreHotbar(Minecraft mc, LocalPlayer player) {
+		if (mc.gameMode == null) return;
+		for (int k = swaps.size() - 1; k >= 0; k--) {
+			int[] sw = swaps.get(k);
+			mc.gameMode.handleInventoryMouseClick(
+					player.inventoryMenu.containerId, sw[0], sw[1], ClickType.SWAP, player);
+		}
+		swaps.clear();
+		player.getInventory().setSelectedSlot(origSlot);
 	}
 
 	/** Messages removed on request - intentionally does nothing. */
